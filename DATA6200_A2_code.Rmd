@@ -1,0 +1,806 @@
+---
+title: "Data6200 Assignment 2"
+author: "Arjun"
+date: "2025-11-12"
+output: html_document
+---
+
+Wildfires have become a defining environmental issue for British Columbia. In this report I use BC Wildfire Service point data (KMZ files) from 2013–2024 to look for patterns in how fires behave over time and space.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(sf)
+library(tidyverse)
+library(httr)
+library(xml2)
+library(rvest)
+library(tmap)
+library(leaflet)
+library(patchwork)
+
+tmap_mode("plot")
+theme_set(theme_minimal())
+
+# Create folders used later
+dir.create("data",        showWarnings = FALSE)
+dir.create("data/kmz",    showWarnings = FALSE)
+dir.create("data/kml",    showWarnings = FALSE)
+dir.create("data/cache",  showWarnings = FALSE)
+
+cache_rds <- "data/cache/fire_points_parsed.rds"
+
+knitr::opts_chunk$set(message = TRUE, warning = TRUE, echo = TRUE)
+
+```
+
+Finding the KMZ files
+
+```{r kmz_inventory}
+kmz_dir <- "data/kmz"
+dir.create(kmz_dir, showWarnings = FALSE)
+
+kmz_files <- list.files(kmz_dir, pattern = "\\.kmz$", full.names = TRUE)
+
+#Searching the whole file
+if (length(kmz_files) == 0) {
+  message("No KMZ files in '", kmz_dir, "'. Searching recursively from: ", getwd())
+  kmz_files <- list.files(getwd(), pattern = "\\.kmz$", full.names = TRUE, recursive = TRUE)
+}
+
+#Fail early if nothing at all
+if (length(kmz_files) == 0) {
+  stop("No .kmz files found. Move your KMZ files into 'data/kmz/' or update the paths.")
+}
+
+
+tibble(found = kmz_files)
+
+```
+
+Now access the kml file from the kmz
+
+```{r kmz_to_kml}
+
+convert_kmz_to_kml <- function(kmz_path, out_root = "data/kml") {
+  stem  <- tools::file_path_sans_ext(basename(kmz_path))
+  exdir <- file.path(out_root, stem)
+  dir.create(exdir, recursive = TRUE, showWarnings = FALSE)
+
+  unzip(kmz_path, exdir = exdir)
+
+  # Most KMZ bundles store the KML at "doc.kml"
+  kml_candidate <- file.path(exdir, "doc.kml")
+  if (!file.exists(kml_candidate)) {
+    kmls <- list.files(exdir, pattern = "\\.kml$", full.names = TRUE, recursive = TRUE)
+    if (length(kmls) == 0) stop("No KML found inside: ", kmz_path)
+    kml_candidate <- kmls[1]
+  }
+  kml_candidate
+}
+
+kml_paths <- vapply(kmz_files, convert_kmz_to_kml, character(1))
+
+# Making sure we get the kml files
+tibble(
+  kmz = basename(kmz_files),
+  kml = kml_paths
+)
+
+```
+
+The KMZ inventory check confirms that all available BC fire point files covering 2013–2024 are being read from disk. Each archive is unzipped into a dedicated folder and its doc.kml file is identified. This gives me a consistent pipeline where new KMZ files could be dropped into data/kmz/ and automatically picked up by the same code, which is important for reproducibility.
+
+Since each file has multiple layers now I have to read all layers.
+
+```{r read_kml_all_layers}
+# Read all non-empty layers for each KML and attach source info
+read_kml_all_layers <- function(kml_path, kmz_path) {
+  L <- sf::st_layers(kml_path)
+  # Fallback: if st_layers gives no names, read default
+  if (is.null(L$name) || length(L$name) == 0) {
+    x <- sf::st_read(kml_path, quiet = TRUE)
+    x$source_kmz  <- basename(kmz_path)
+    x$source_kml  <- basename(kml_path)
+    x$source_layer <- "(default)"
+    return(x)
+  }
+  out <- list()
+  for (ly in L$name) {
+    x <- try(suppressWarnings(sf::st_read(kml_path, layer = ly, quiet = TRUE)), silent = TRUE)
+    if (inherits(x, "try-error")) next
+    if (nrow(x) == 0) next
+    x$source_kmz   <- basename(kmz_path)
+    x$source_kml   <- basename(kml_path)
+    x$source_layer <- ly
+    out[[length(out) + 1]] <- x
+  }
+  if (length(out) == 0) return(NULL)
+  dplyr::bind_rows(out)
+}
+
+kml_list <- Map(read_kml_all_layers, kml_paths, kmz_files)
+kml_list <- kml_list[!vapply(kml_list, is.null, logical(1))]
+
+fire_points_raw <- suppressWarnings(dplyr::bind_rows(kml_list))
+
+cat("# Rows after reading ALL layers: ", nrow(fire_points_raw), "\n")
+print(table(as.character(sf::st_geometry_type(sf::st_geometry(fire_points_raw),
+                                              by_geometry = TRUE))))
+print(head(names(fire_points_raw), 20))
+
+
+```
+
+Now I will normalize the geometry
+
+```{r normalize_geometry}
+# Drop Z/M dimensions (if present)
+fire_points_raw <- sf::st_zm(fire_points_raw, drop = TRUE, what = "ZM")
+
+# Cast MULTIPOINT to POINT (one feature per point)
+if (any(as.character(sf::st_geometry_type(fire_points_raw)) == "MULTIPOINT")) {
+  suppressWarnings({
+    fire_points_raw <- sf::st_cast(fire_points_raw, "POINT", warn = FALSE)
+  })
+}
+
+# If anything isn't POINT, fall back to centroids
+geom_types <- as.character(sf::st_geometry_type(fire_points_raw))
+if (!all(geom_types %in% "POINT")) {
+  suppressWarnings({
+    sf::st_geometry(fire_points_raw) <- sf::st_centroid(sf::st_geometry(fire_points_raw))
+  })
+}
+
+# Ensure CRS is WGS84
+if (is.na(sf::st_crs(fire_points_raw))) sf::st_crs(fire_points_raw) <- 4326
+
+# Attach lon/lat for quick checks
+coords <- sf::st_coordinates(fire_points_raw)
+fire_points_raw$lon <- coords[, 1]
+fire_points_raw$lat <- coords[, 2]
+
+
+```
+
+The raw geometry in the KML files is slightly messy: some features are stored as MULTIPOINT with extra Z/M dimensions. I standardize everything to simple 2D points in WGS84 (lon/lat) and attach explicit longitude/latitude columns. This step doesn’t change any locations, but it makes later filtering, plotting and joining much more reliable (for example later when I restrict to a BC bounding box or feed the points into leaflet)
+
+```{r inspect-description, echo=TRUE}
+# Show raw HTML of one record
+cat(substr(fire_points_raw$Description[1], 1, 500))
+
+# Manually parse one Description
+example_html <- read_html(charToRaw(fire_points_raw$Description[1]))
+trs          <- xml_find_all(example_html, "//tr")
+
+xml_find_all(trs, "./td") %>%
+  html_text(trim = TRUE)
+```
+
+```{r parse_description, message=TRUE, warning=TRUE}
+#Parse HTML Description into real columns
+
+if (file.exists(cache_rds)) {
+  fire_points <- readRDS(cache_rds)
+} else {
+  # Start from raw sf with Description + geometry
+  fire_points <- fire_points_raw
+
+
+  parse_description <- function(desc) {
+    # Handle empty descriptions
+    if (is.na(desc) || desc == "") {
+      return(tibble())
+    }
+
+    # Safely parse HTML
+    html <- try(read_html(charToRaw(desc)), silent = TRUE)
+    if (inherits(html, "try-error")) {
+      return(tibble())
+    }
+
+    # Extract table rows
+    trs  <- xml_find_all(html, "//tr")
+    vars <- character()
+    vals <- character()
+
+    for (tr in trs) {
+      td <- xml_find_all(tr, "./td") %>% html_text(trim = TRUE)
+      # Only keep rows that look like key–value pairs
+      if (length(td) == 2) {
+        vars <- c(vars, td[1])
+        vals <- c(vals, td[2])
+      }
+    }
+
+    # Convert to wide format (one row per fire)
+    if (length(vars) == 0) return(tibble())
+    tibble(variable = vars, value = vals) %>%
+      tidyr::pivot_wider(names_from = variable, values_from = value)
+  }
+
+  # Apply parsing function to all Description values
+  parsed_data <- fire_points$Description %>%
+    purrr::map_dfr(parse_description, .id = "row_id") %>%
+    mutate(row_id = as.integer(row_id))
+
+  # Merge parsed attributes back to spatial data
+  fire_points <- fire_points %>%
+    mutate(row_id = dplyr::row_number()) %>%
+    left_join(parsed_data, by = "row_id") %>%
+    select(-row_id)   # keep Description if you want; we only drop row_id
+
+  # --- Standardise core fields into fireyear / currentsize / cause_general_kmz ---
+
+  coalesce_numeric_cols <- function(df, candidates) {
+    cols <- intersect(candidates, names(df))
+    if (length(cols) == 0) return(rep(NA_real_, nrow(df)))
+    vecs <- lapply(cols, function(nm) suppressWarnings(as.numeric(df[[nm]])))
+    Reduce(dplyr::coalesce, vecs)
+  }
+
+
+  coalesce_character_cols <- function(df, candidates) {
+    cols <- intersect(candidates, names(df))
+    if (length(cols) == 0) return(rep(NA_character_, nrow(df)))
+    vecs <- lapply(cols, function(nm) as.character(df[[nm]]))
+    Reduce(dplyr::coalesce, vecs)
+  }
+
+  fire_points$fireyear <- coalesce_numeric_cols(
+    fire_points,
+    c("FIREYEAR", "FIRE_YEAR", "YEAR")
+  )
+
+  fire_points$currentsize <- coalesce_numeric_cols(
+    fire_points,
+    c("CURRENTSIZE", "CURRENT_SIZE", "FIRE_SIZE_HA")
+  )
+
+  fire_points$cause_general_kmz <- coalesce_character_cols(
+    fire_points,
+    c("CAUSE_GENERAL_KMZ", "CAUSE GENERAL")
+  )
+
+  # Attach lon/lat from geometry
+  coords <- sf::st_coordinates(sf::st_geometry(fire_points))
+  fire_points$lon <- coords[, 1]
+  fire_points$lat <- coords[, 2]
+
+  saveRDS(fire_points, cache_rds)
+}
+
+cat(
+  "N non-NA (year,size,cause): ",
+  sum(!is.na(fire_points$fireyear)), ", ",
+  sum(!is.na(fire_points$currentsize)), ", ",
+  sum(!is.na(fire_points$cause_general_kmz)), "\n",
+  sep = ""
+)
+
+# quick peek at first few rows (no geometry)
+fire_points %>%
+  sf::st_drop_geometry() %>%
+  select(Name, fireyear, currentsize, cause_general_kmz, lon, lat) %>%
+  head(5) %>%
+  print(width = 140)
+
+```
+
+All of the interesting attributes – year, current size, cause – live inside a single HTML “Description” column. I treat each row as a tiny HTML table, extract the key–value pairs, pivot them into wide format. I then create harmonized columns (fireyear, currentsize, cause_general_kmz) from multiple candidates. This turns a hierarchical, semi-structured field into a regular dataset that can be summarized.
+
+```{r website scraping }
+url_stats <- "https://www2.gov.bc.ca/gov/content/safety/wildfire-status/about-bcws/wildfire-statistics/wildfire-averages"
+
+page   <- read_html(url_stats)
+tables <- html_elements(page, "table")
+
+# First table is the main year summary
+bc_table_raw <- tables[[1]] %>% html_table(fill = TRUE)
+
+names(bc_table_raw) <- c(
+  "year",
+  "total_fires",
+  "total_hectares",
+  "total_cost",
+  "human_caused",
+  "lightning_caused"
+)
+
+bc_stats <- bc_table_raw %>%
+  filter(stringr::str_detect(year, "^\\d{4}$")) %>%
+  mutate(
+    year             = as.integer(year),
+    total_fires      = readr::parse_number(total_fires),
+    total_hectares   = readr::parse_number(total_hectares),
+    human_caused     = readr::parse_number(human_caused),
+    lightning_caused = readr::parse_number(lightning_caused)
+  ) %>%
+  filter(year >= 2013, year <= 2024)
+
+bc_stats
+
+
+```
+
+Now I scrape the official BCWS “wildfire averages” table for 2012–2024.The link for which is "<https://www2.gov.bc.ca/gov/content/safety/wildfire-status/about-bcws/wildfire-statistics/wildfire-averages>". And then I compare them later.
+
+This table provides yearly totals for number of fires and total hectares burned, as well as counts by cause. Later I compare these official aggregates to what I compute from the point data; if the two sources agree fairly well, it increases confidence that my parsing and deduplication steps are not introducing major bias.
+
+```{r}
+# Clean fields and restrict to BC + 2013-2024
+fire_points_clean <- fire_points %>%
+  # make sure everything is in WGS84
+  st_transform(4326) %>%
+  # Simple BC-ish bounding box 
+  filter(
+    dplyr::between(lon, -140, -113),
+    dplyr::between(lat,   48,   60)
+  ) %>%
+  mutate(
+    FIRE_YEAR     = as.integer(fireyear),
+    SIZE_HA       = as.numeric(currentsize),
+    CAUSE_GENERAL = cause_general_kmz
+  ) %>%
+  filter(!is.na(FIRE_YEAR))
+
+
+
+#collapse duplicate fires that appear in multiple KMZ bundles
+fire_points_unique <- fire_points_clean %>%
+  arrange(FIRE_YEAR, Name, desc(SIZE_HA)) %>%   # use KML Name as fire ID
+  group_by(FIRE_YEAR, Name) %>%
+  slice_head(n = 1) %>%                          # keep one row per fire/year
+  ungroup()
+
+
+#assignment window using de-duplicated fires + clean cause labels
+fire_points_2013_2024 <- fire_points_unique %>%
+  filter(FIRE_YEAR >= 2013, FIRE_YEAR <= 2024) %>%   # starting at 2013 
+  mutate(
+    lower_cause = stringr::str_to_lower(CAUSE_GENERAL),
+    CAUSE_GROUPED = case_when(
+      stringr::str_detect(lower_cause, "human|person|people") ~ "Human",
+      stringr::str_detect(lower_cause, "lightning")           ~ "Lightning",
+      stringr::str_detect(lower_cause, "natural")             ~ "Lightning", 
+      stringr::str_detect(lower_cause,
+                          "none|unknown|undetermined|other|investigat|not available|n/a") ~
+        "Unknown/None",
+      is.na(lower_cause) ~ "Unknown/None",
+      TRUE ~ CAUSE_GENERAL
+    )
+  ) %>%
+  select(-lower_cause)
+
+nrow(fire_points_2013_2024)
+table(fire_points_2013_2024$FIRE_YEAR)
+table(fire_points_2013_2024$CAUSE_GROUPED, useNA = "ifany")
+
+```
+
+```{r}
+fire_yearly_kmz <- fire_points_2013_2024 %>%
+  filter(!is.na(SIZE_HA), SIZE_HA > 0) %>%
+  group_by(FIRE_YEAR) %>%
+  summarise(
+    n_fires        = n(),
+    total_hectares = sum(SIZE_HA, na.rm = TRUE),
+    mean_size_ha   = mean(SIZE_HA, na.rm = TRUE),
+    median_size_ha = median(SIZE_HA, na.rm = TRUE),
+    .groups        = "drop"
+  ) %>%
+  rename(year = FIRE_YEAR)
+
+fire_yearly_kmz
+
+
+# Fire count per year
+fires_per_year <- fire_points_2013_2024 %>%
+  st_drop_geometry() %>%
+  count(FIRE_YEAR, name = "n_fires")
+
+ggplot(fires_per_year, aes(x = as.factor(FIRE_YEAR), y = n_fires)) +
+  geom_col(fill = "#5DA") +
+  geom_text(aes(label = scales::comma(n_fires)),
+            vjust = -0.4, size = 3) +
+  labs(
+    title = "Fire Records by Year (2013–2024)",
+    x     = "Year",
+    y     = "Number of Fires"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+The bar chart shows large swings in the number of recorded fires from year to year. The quietest season was 2020 ,while busy years climb to well over two thousand(2017 and 2018). There isn’t a simple upward trend over time.Instead it keep increasing or decreasing yearly, with clusters of active years broken by a realtively calm year.
+
+Distribution by size of fires
+
+```{r size trends, message=FALSE, warning=FALSE}
+
+# Yearly size summaries
+size_year <- fire_points_2013_2024 %>%
+  st_drop_geometry() %>%
+  filter(!is.na(SIZE_HA), SIZE_HA > 0) %>%
+  group_by(FIRE_YEAR) %>%
+  summarise(
+    total_area_ha = sum(SIZE_HA, na.rm = TRUE),
+    mean_size_ha  = mean(SIZE_HA, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# For nicer y-axis and labels on Panel A
+max_area <- max(size_year$total_area_ha, na.rm = TRUE)
+
+# Panel A: Total area burned
+p_area <- ggplot(size_year, aes(x = as.factor(FIRE_YEAR), y = total_area_ha)) +
+  geom_col(fill = "#FF9933") +
+  geom_text(
+    aes(label = scales::comma(round(total_area_ha))),
+    vjust = -0.2, size = 3
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    limits = c(0, max_area * 1.15),          # add headroom so labels don’t get cut
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    title = "A. Total Area Burned",
+    x     = NULL,
+    y     = "Total Area (hectares)"
+  ) +
+  coord_cartesian(clip = "off") +            # allow labels to draw outside panel
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.margin = margin(t = 15, r = 5, b = 5, l = 5)
+  )
+
+# Panel B: Mean fire size
+p_mean <- ggplot(size_year, aes(x = FIRE_YEAR, y = mean_size_ha)) +
+  geom_line(colour = "#4b6cb7") +
+  geom_point(colour = "#4b6cb7", size = 2) +
+  geom_smooth(se = TRUE, linetype = "dashed", size = 0.7) +
+  geom_text(
+    aes(label = round(mean_size_ha, 1)),
+    vjust = -0.6, size = 3
+  ) +
+  labs(
+    title = "B. Mean Fire Size",
+    x     = "Year",
+    y     = "Mean Area (hectares)"
+  ) +
+  theme_minimal()
+
+# Combine panels
+(p_area / p_mean) +
+  plot_annotation(
+    title = "Wildfire Size Trends in British Columbia (2013–2024)",
+    subtitle = "Total burned area (top) and mean fire size (bottom)",
+    theme = theme(plot.title = element_text(face = "bold"))
+  )
+
+
+```
+
+Looking at total area burned gives us more details. The top bar graph highlights a few standout years – notably 2017, 2018, 2021 and 2024 – where the total burned area jumps by an order of magnitude relative to quieter seasons. These peaks show that a small number of extreme years dominate the long-term damage.
+
+The bottom line chart (mean fire size) reinforces the same idea: most years have very small average fires, but when one or two very large fires occur, they drag the mean up dramatically.
+
+So from this we conclude that British Columbia’s wildfire risk is driven less by a steady increase in everyday fires and more by occasional seasons with multiple large or hard-to-control ones.
+
+```{r size-distribution-by-year, message=FALSE, warning=FALSE}
+fires_size <- fire_points_2013_2024 %>%
+  st_drop_geometry() %>%
+  filter(!is.na(SIZE_HA), SIZE_HA > 0)
+
+
+ggplot(fires_size, aes(x = as.factor(FIRE_YEAR), y = SIZE_HA)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_y_log10(
+    breaks = c(0.1, 1, 10, 100, 1000, 10000),
+    labels = c("0.1", "1", "10", "100", "1,000", "10,000")
+  ) +
+  labs(
+    title = "Distribution of Fire Sizes by Year",
+    x     = "Year",
+    y     = "Fire size (hectares, log scale)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+The log-scale boxplot shows that in every year, the median fire remains smaller typically well under one hectare. Most points hug the bottom of the plot, while a long tail of outliers extends upward. This pattern confirms that the province experiences many small fires and a small number of very large ones. It also helps explain why count-based and area-based metrics can disagree: a year with average counts can still be devastating if just a handful of fires are very problematic
+
+```{r}
+compare_yearly <- fire_yearly_kmz %>%
+  # drop geometry 
+  sf::st_drop_geometry() %>%
+  filter(year >= 2013, year <= 2024) %>%
+  inner_join(
+    bc_stats %>% dplyr::select(year, total_fires, total_hectares),
+    by     = "year",
+    suffix = c("_kmz", "_official")
+  ) %>%
+  mutate(
+    frac_fires    = n_fires / total_fires,
+    frac_hectares = total_hectares_kmz / total_hectares_official
+  )
+
+# check the names so we can see what’s there
+names(compare_yearly)
+compare_yearly
+
+
+
+```
+
+```{r compare-kmz-official, echo=FALSE}
+p_fires <- ggplot(compare_yearly, aes(x = year)) +
+  geom_line(aes(y = n_fires, colour = "KMZ points"), linewidth = 0.9) +
+  geom_point(aes(y = n_fires, colour = "KMZ points"), size = 2) +
+  geom_line(aes(y = total_fires, colour = "BCWS official"),
+            linewidth = 0.9, linetype = "dashed") +
+  geom_point(aes(y = total_fires, colour = "BCWS official"), size = 2) +
+  labs(
+    title  = "Number of fires per year (2013–2024)",
+    x      = "Year",
+    y      = "Number of fires",
+    colour = NULL
+  ) +
+  theme_minimal()
+
+p_hectares <- ggplot(compare_yearly, aes(x = year)) +
+  geom_line(aes(y = total_hectares_kmz, colour = "KMZ points"), linewidth = 0.9) +
+  geom_point(aes(y = total_hectares_kmz, colour = "KMZ points"), size = 2) +
+  geom_line(aes(y = total_hectares_official, colour = "BCWS official"),
+            linewidth = 0.9, linetype = "dashed") +
+  geom_point(aes(y = total_hectares_official, colour = "BCWS official"), size = 2) +
+  scale_y_continuous(
+    labels = function(x) format(x, big.mark = ",", scientific = FALSE)
+  ) +
+  labs(
+    title  = "Total hectares burned per year (2013–2024)",
+    x      = "Year",
+    y      = "Total hectares",
+    colour = NULL
+  ) +
+  theme_minimal()
+
+(p_fires / p_hectares) +
+  patchwork::plot_annotation(
+    title = "Wildfire activity in BC: KMZ vs official statistics (2013–2024)",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  )
+
+
+```
+
+The comparison with official BCWS statistics is reassuring. For both fire counts and total hectares burned, the KMZ points derived values track the official series closely across 2013–2024, including the extreme peaks in 2017–2018 and 2021 and the relatively mild 2020 season. There are small differences in some years, which likely reflect the way I deduplicated fires and filtered to a BC bounding box but the overall pattern is the same. This suggests that the point data was reliable enough to use for more detailed analysis.
+
+**Wildfire Locations in BC comparison**
+
+```{r map-periods, message=FALSE, warning=FALSE}
+fires_period <- fire_points_2013_2024 %>%
+  mutate(
+    period = dplyr::case_when(
+      FIRE_YEAR %in% 2013:2015 ~ "2013–2015",
+      FIRE_YEAR %in% 2016:2019 ~ "2016–2019",
+      FIRE_YEAR %in% 2020:2024 ~ "2020–2024",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(period))
+
+ggplot(fires_period) +
+  geom_sf(aes(colour = period), alpha = 0.45, size = 0.25) +
+  coord_sf(
+    xlim   = c(-140, -113),
+    ylim   = c(48, 60),
+    expand = FALSE
+  ) +
+  facet_wrap(~ period, ncol = 3) +
+  scale_colour_manual(
+    values = c(
+      "2013–2015" = "#1b9e77",  # green
+      "2016–2019" = "#808000",  # olive
+      "2020–2024" = "#36454F"   # charcoal
+    ),
+    name = "Period"
+  ) +
+  
+  scale_x_continuous(
+    breaks = seq(-135, -115, by = 5),
+    labels = function(x) paste0(abs(x), "°W")
+  ) +
+  scale_y_continuous(
+    breaks = seq(48, 60, by = 4),
+    labels = function(y) paste0(y, "°N")
+  ) +
+  labs(
+    title = "Wildfire Locations in BC by Period (2013–2024)",
+    x     = "Longitude",
+    y     = "Latitude"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major = element_line(linewidth = 0.2, colour = "grey85"),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(angle = 0, vjust = 0.5, size = 7),
+    strip.text       = element_text(face = "bold")
+    
+  )
+
+
+```
+
+The triple map summarizes how wildfire locations are distributed across the province in different time periods. Across all periods, fires cluster strongly in the BC interior while the coastal areas see far fewer ignitions. The later periods show some expansion toward the north and northeast, but the core fire belt remains remarkably stable. This could imply that long-term fire geography is shaped by climate and therefore the interior is very clustered.
+
+**Fire Distribution by Cause**
+
+```{r map-human-vs-lightning, message=FALSE, warning=FALSE}
+# Filter to Human vs Lightning fires
+fires_hl <- fire_points_2013_2024 %>%
+  filter(CAUSE_GROUPED %in% c("Human", "Lightning")) %>%
+  st_transform(4326)
+
+# Colour palette for causes
+pal_hl <- colorFactor(
+  palette = c("#E66101", "#5E3C99"),
+  domain  = c("Human", "Lightning")
+)
+
+leaflet(fires_hl) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lng  = ~lon,
+    lat  = ~lat,
+    radius = 3,
+    color  = ~pal_hl(CAUSE_GROUPED),
+    stroke = FALSE,
+    fillOpacity = 0.6,
+    popup = ~paste0(
+      "<b>Year:</b> ", FIRE_YEAR, "<br>",
+      "<b>Cause:</b> ", CAUSE_GROUPED, "<br>",
+      "<b>Size (ha):</b> ", round(SIZE_HA, 1)
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal      = pal_hl,
+    values   = ~CAUSE_GROUPED,
+    title    = "Cause"
+  )
+
+```
+
+Zoom and pan to explore where human and lightning caused fires occur. Clicking on a point reveals the year, cause, and estimated size of each fire.
+
+**Interactive time period map**
+
+```{r map-period-interactive, message=FALSE, warning=FALSE}
+# Create period categories starting at 2013
+fires_period <- fire_points_2013_2024 %>%
+  mutate(
+    PERIOD = dplyr::case_when(
+      FIRE_YEAR %in% 2013:2016 ~ "2013–2016",
+      FIRE_YEAR %in% 2017:2020 ~ "2017–2020",
+      FIRE_YEAR %in% 2021:2024 ~ "2021–2024",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(PERIOD)) %>%
+  st_transform(4326)
+
+# 3-colour palette for the periods
+pal_period <- colorFactor(
+  palette = c("magenta", "yellow", "maroon"),
+  domain  = c("2013–2016", "2017–2020", "2021–2024")
+)
+
+leaflet(fires_period) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lng  = ~lon,
+    lat  = ~lat,
+    radius = 2,
+    color  = ~pal_period(PERIOD),
+    stroke = FALSE,
+    fillOpacity = 0.5,
+    popup = ~paste0(
+      "<b>Year:</b> ", FIRE_YEAR, "<br>",
+      "<b>Cause:</b> ", CAUSE_GROUPED, "<br>",
+      "<b>Size (ha):</b> ", round(SIZE_HA, 1)
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal      = pal_period,
+    values   = ~PERIOD,
+    title    = "Time period"
+  )
+```
+
+Fires are coloured by broad time period (2013–2016, 2017–2020, 2021–2024). Use zoom and pan to see how the spatial pattern of activity changes across the province over time.
+
+```{r cause-totals-bar, echo=FALSE, message=FALSE, warning=FALSE}
+fires_known_all <- fire_points_2013_2024 %>%
+  sf::st_drop_geometry() %>%
+  filter(CAUSE_GROUPED %in% c("Human", "Lightning"))
+
+cause_totals <- fires_known_all %>%
+  count(CAUSE_GROUPED, name = "n_fires") %>%
+  mutate(
+    prop = n_fires / sum(n_fires)
+  )
+
+cause_totals
+
+ggplot(cause_totals,
+       aes(x = CAUSE_GROUPED, y = n_fires, fill = CAUSE_GROUPED)) +
+  geom_col(width = 0.6) +
+  geom_text(
+    aes(label = format(n_fires, big.mark = ",")),
+    vjust = -0.4,
+    size  = 3.2
+  ) +
+  scale_fill_manual(
+    values = c("Human" = "#E66101", "Lightning" = "#5E3C99"),
+    guide  = "none"
+  ) +
+  labs(
+    title = "Total number of fires by cause",
+    x     = "Cause",
+    y     = "Number of fires"
+  ) +
+  theme_minimal()
+
+```
+
+When I restrict to fires with a known cause between 2013–2024, lightning is clearly responsible for more ignitions than people. The data contain 4,616 lightning-caused fires compared with 2,966 human-caused fires, so roughly 60% of known fires start from lightning and 40% from human activity. This means that we should treat both causes as important, but it also emphasizes that even if we eliminated every human-caused ignition, a large share of BC’s wildfire activity would still remain because of lightning during hot, dry summers.
+
+```{r cause-frequency-and-size, echo=FALSE, message=FALSE, warning=FALSE}
+
+fires_known_size <- fire_points_2013_2024 %>%
+  sf::st_drop_geometry() %>%
+  filter(
+    CAUSE_GROUPED %in% c("Human", "Lightning"),
+    !is.na(SIZE_HA),
+    SIZE_HA > 0
+  )
+
+ggplot(fires_known_size,
+       aes(x = CAUSE_GROUPED, y = SIZE_HA, fill = CAUSE_GROUPED)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  scale_y_log10(
+    breaks = c(0.1, 1, 10, 100, 1000, 10000),
+    labels = c("0.1", "1", "10", "100", "1,000", "10,000")
+  ) +
+  scale_fill_manual(
+    values = c("Human" = "#E66101", "Lightning" = "#5E3C99"),
+    name   = "Cause"
+  ) +
+  stat_summary(
+    fun   = mean,
+    geom  = "point",
+    shape = 21,
+    size  = 2.5,
+    colour = "black",
+    fill   = "white"
+  ) +
+  labs(
+    title = "Fire size by cause (Human vs Lightning, known sizes)",
+    x     = "Cause",
+    y     = "Fire size (hectares, log scale)"
+  ) +
+  theme_minimal()
+
+```
+
+For both causes, the median fire is very small—well under 1 hectare. The medians are quite similar, with lightning fires having a slightly lower median size than human fires.The difference appears in the upper tail. Lightning-caused fires have more extreme outliers because alot of points seem to be clustered in the 1000-10000 region, the human caused fires also has outliers but it seems much less clustered.
+
+This suggests that while most human and lightning fires are similarly small, lightning-caused fires are more likely to become very large once they escape initial stage or control.
