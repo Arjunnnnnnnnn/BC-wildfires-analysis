@@ -1,19 +1,8 @@
-# BC-wildfires-analysis
-
-
-
----
-
-## 2️⃣ `bc-wildfires-spatiotemporal-analysis` – README.md
-
-```markdown
 # BC Wildfires 2013–2024: Spatio-Temporal Analysis in R
 
 End-to-end R workflow analysing wildfire frequency, burned area, spatial distribution,
 and ignition causes in British Columbia using BC Wildfire Service point data (KMZ) and
 official yearly summaries (2013–2024). :contentReference[oaicite:9]{index=9}  
-
----
 
 ## 1. Project Overview
 
@@ -26,7 +15,6 @@ statistics** to answer:
 
 Developed as **Assignment 2** for **DATA*6200**.
 
----
 
 ## 2. Data & Sources
 
@@ -38,7 +26,6 @@ Developed as **Assignment 2** for **DATA*6200**.
   - Total hectares burned
   - Counts by ignition cause (human, lightning, etc.)
 
----
 
 ## 3. Methods
 
@@ -75,7 +62,6 @@ Developed as **Assignment 2** for **DATA*6200**.
    - Two-panel plot shows both series track closely, including extreme years like
      **2017–2018 and 2021**, giving confidence in the processed dataset. :contentReference[oaicite:17]{index=17}  
 
----
 
 ## 4. Analysis & Visualisations
 
@@ -121,11 +107,8 @@ Developed as **Assignment 2** for **DATA*6200**.
   - Human fires cluster near populated areas/highways.
   - Lightning fires are more evenly spread across remote interior regions.
 
----
-
 ## 5. Repository Structure
 
-```text
 bc-wildfires-spatiotemporal-analysis/
 ├─ R/
 │  ├─ 01_load_kmz_to_sf.R
